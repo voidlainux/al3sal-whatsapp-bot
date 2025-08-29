@@ -1,0 +1,668 @@
+import datetime
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+import structlog
+from langdetect import detect, LangDetectException
+from pydantic import BaseModel
+
+from app.config import Settings
+from app.database import DatabaseService
+from app.models import UserSession
+from app.services import GoogleSheetService, OpenAIService, WhatsAppBridgeService
+
+logger = structlog.get_logger(__name__)
+
+
+class ConversationManager:
+    def __init__(self, db_service: DatabaseService, whatsapp_service: WhatsAppBridgeService, sheet_service: GoogleSheetService, openai_service: OpenAIService, settings: Settings):
+        self.db = db_service
+        self.whatsapp = whatsapp_service
+        self.sheets = sheet_service
+        self.openai = openai_service
+        self.settings = settings
+        self.SYSTEM_PROMPT = self.settings.SYSTEM_PROMPT
+        self.EMPLOYEE_NOTIFICATION_TEMPLATE = "*تنبيه: مطلوب تدخل بشري*\n\nالعميل `{customer_id}` بحاجة إلى مساعدة.\n\n*السبب:* {reason}\n\nيرجى فتح واتساب والتواصل معه."
+        self.ROUTINE_RESPONSES = {
+            ("شكرا", "مشكور", "يسلمو"): "على الرحب والسعة!",
+            ("مرحبا", "هلا", "السلام عليكم"): "أهلاً بك. كيف يمكنني خدمتك؟",
+            ("تمام", "اوك", "ك"): "بالخدمة.",
+        }
+
+    def _detect_language(self, text: str) -> str:
+        try:
+            return 'ar' if detect(text) == 'ar' else 'en'
+        except LangDetectException:
+            return 'en'
+
+    def _flight_formatter(self, item: Dict) -> str:
+        price_str = f"{item.get('usd_price')}$" if item.get('usd_price') else "N/A"
+        origin = item.get('depart_airport', 'N/A')
+        destination = item.get('destination_airport', 'N/A')
+        date = item.get('depart_date', 'N/A')
+        return f"رحلة من {origin} إلى {destination} | بتاريخ {date} | السعر: {price_str}"
+
+    def _format_flight_details(self, item: Dict) -> str:
+        title = f"*{item.get('type', 'رحلة')} إلى {item.get('destination_airport')}*"
+        parts = [title]
+        if item.get('depart_airport') and item.get('destination_airport'):
+            parts.append(f"• *المسار:* من {item['depart_airport']} إلى {item['destination_airport']}")
+        if item.get('depart_date'):
+            parts.append(f"• *تاريخ الإقلاع:* {item['depart_date']}")
+        if item.get('return_date'):
+            parts.append(f"• *تاريخ العودة:* {item['return_date']}")
+        if item.get('time_of_depart'):
+            parts.append(f"• *وقت الإقلاع:* {item['time_of_depart']}")
+        if item.get('time_of_arrival'):
+            parts.append(f"• *وقت الوصول:* {item['time_of_arrival']}")
+        if item.get('duration'):
+            parts.append(f"• *مدة الرحلة:* {item['duration']}")
+        if item.get('usd_price'):
+            parts.append(f"• *السعر:* {item['usd_price']} دولار أمريكي")
+        if item.get('syp_price'):
+            parts.append(f"• *السعر:* {item['syp_price']} ليرة سورية")
+        if item.get('airline'):
+            parts.append(f"• *شركة الطيران:* {item['airline']}")
+        if item.get('notes'):
+            parts.append(f"• *ملاحظات:* {item['notes']}")
+        return "\n".join(parts)
+
+    def _format_offer_details(self, item: Dict) -> str:
+        parts = [f"إليك تفاصيل: *{item.get('name')}*"]
+        if item.get('depart') and item.get('destination'):
+            parts.append(f"*المسار:* من {item['depart']} إلى {item['destination']}")
+        if item.get('usd_price'):
+            parts.append(f"*السعر:* {item['usd_price']} دولار أمريكي")
+        if item.get('syp_price'):
+            parts.append(f"*السعر:* {item['syp_price']} ليرة سورية")
+        if item.get('details'):
+            parts.append(f"*التفاصيل:* {item['details']}")
+        if item.get('valid_until'):
+            parts.append(f"*صالح لغاية:* {item['valid_until']}")
+        if item.get('notes'):
+            parts.append(f"*ملاحظات:* {item['notes']}")
+        return "\n\n".join(parts)
+
+    def _format_service_details(self, item: Dict) -> str:
+        parts = [f"إليك تفاصيل خدمة: *{item.get('service')}*"]
+        if item.get('usd_price'):
+            parts.append(f"• *السعر:* {item['usd_price']} دولار أمريكي")
+        if item.get('syp_price'):
+            parts.append(f"• *السعر:* {item['syp_price']} ليرة سورية")
+        if item.get('details'):
+            parts.append(f"• *التفاصيل:* {item['details']}")
+        if item.get('notes'):
+            parts.append(f"• *ملاحظات:* {item['notes']}")
+        return "\n\n".join(parts)
+
+    def _format_umrah_details(self, item: Dict) -> str:
+        parts = [f"*{item.get('name_and_type')}*"]
+        if item.get('usd_price'):
+            parts.append(f"*السعر:* {item['usd_price']} دولار أمريكي")
+        if item.get('syp_price'):
+            parts.append(f"*السعر:* {item['syp_price']} ليرة سورية")
+        if item.get('duration'):
+            parts.append(f"*المدة:* {item['duration']} يوم")
+        if item.get('last_date_for_register'):
+            parts.append(f"*آخر وقت للتسجيل:* {item['last_date_for_register']}")
+        if item.get('company_of_trasnport'):
+            parts.append(f"*الشركة:* {item['company_of_trasnport']}")
+        if item.get('estimated_time'):
+            parts.append(f"*مدة الانجاز:* {item['estimated_time']}")
+        hotel_type_map = {
+            "1": "فردي", "2": "ثنائي", "3": "ثلاثي", "4": "رباعي",
+            "5": "خماسي", "6": "سداسي", "7": "سباعي", "8": "ثماني",
+            "9": "تساعي", "10": "عشاري"
+        }
+        if item.get('type_of_hotel'):
+            parts.append(f"*السكن:* {hotel_type_map.get(str(item['type_of_hotel']), item['type_of_hotel'])}")
+        if item.get('hotel_category'):
+            parts.append(f"*تصنيف الفندق:* {item['hotel_category']} نجوم")
+        if item.get('details'):
+            parts.append(f"*التفاصيل:* {item['details']}")
+        if item.get('notes'):
+            parts.append(f"*الملاحظات:* {item['notes']}")
+        return "\n".join(parts)
+
+    def _format_visa_details(self, item: Dict) -> str:
+        title = f"*{item.get('type')} إلى {item.get('country')}*"
+        parts = [title]
+        if item.get('usd_price'):
+            parts.append(f"• *السعر:* {item['usd_price']} دولار أمريكي")
+        if item.get('syp_price'):
+            parts.append(f"• *السعر:* {item['syp_price']} ليرة سورية")
+        if item.get('estimated_time'):
+            parts.append(f"• *المدة التقديرية:* {item['estimated_time']}")
+        if item.get('required_papers'):
+            parts.append(f"• *الأوراق المطلوبة:* {item['required_papers']}")
+        if item.get('valid_until'):
+            parts.append(f"• *صلاحية الفيزا:* {item['valid_until']}")
+        if item.get('notes'):
+            parts.append(f"• *ملاحظات:* {item['notes']}")
+        return "\n".join(parts)
+
+    async def _handle_numeric_choice(self, sender_id: str, message_body: str, session: UserSession, lang: str) -> bool:
+        context = session.context
+        if not (context and 'step' in context and message_body.isdigit()):
+            return False
+
+        step = context.get('step')
+        data = context.get('data', [])
+
+        try:
+            choice_index = int(message_body) - 1
+            if not (0 <= choice_index < len(data)):
+                await self.whatsapp.send_message(sender_id, "خيار غير صالح. يرجى اختيار رقم من القائمة.")
+                return True
+        except (ValueError, IndexError):
+            return False
+
+        selected_item = data[choice_index]
+        new_session = UserSession(state='bot', context=session.context)
+        response_text_ar = ""
+
+        if step == 'awaiting_umrah_choice':
+            response_text_ar = self._format_umrah_details(selected_item)
+        elif step == 'awaiting_service_choice':
+            response_text_ar = self._format_service_details(selected_item)
+        elif step == 'awaiting_offer_choice':
+            response_text_ar = self._format_offer_details(selected_item)
+        elif step == 'awaiting_flight_choice':
+            response_text_ar = self._format_flight_details(selected_item)
+        elif step == 'awaiting_visa_country_choice':
+            country = selected_item
+            all_visas = self.sheets.get_data('visas')
+            country_visas = [v for v in all_visas if self._normalize_arabic(str(v.get('country', '')).lower()) == self._normalize_arabic(country.lower())]
+
+            summary_lines = [f"اختر نوع الفيزا لدولة *{country}*:", ""]
+            for i, visa in enumerate(country_visas):
+                validity = f"- (صالحة لمدة) {visa['valid_until']}" if visa.get('valid_until') else ""
+                summary_lines.append(f"{i + 1}. {country} {visa.get('type', 'N/A')} {validity}")
+            summary_lines.append("\nلمعرفة التفاصيل الكاملة، يرجى إرسال الرقم.")
+            response_text_ar = "\n".join(summary_lines)
+
+            new_session.context['step'] = 'awaiting_visa_details_choice'
+            new_session.context['data'] = country_visas
+        elif step == 'awaiting_visa_type_choice':
+            visa_type = selected_item
+            all_visas = self.sheets.get_data('visas')
+            type_visas = [v for v in all_visas if self._normalize_arabic(str(v.get('type', '')).lower()) == self._normalize_arabic(visa_type.lower())]
+
+            summary_lines = [f"اختر الدولة لفيزا (*{visa_type}*):", ""]
+            for i, visa in enumerate(type_visas):
+                price = f"- {visa['usd_price']}$" if visa.get('usd_price') else ""
+                summary_lines.append(f"{i + 1}. {visa.get('country', 'N/A')} {price}")
+            summary_lines.append("\nلمعرفة التفاصيل الكاملة، يرجى إرسال الرقم.")
+            response_text_ar = "\n".join(summary_lines)
+
+            new_session.context['step'] = 'awaiting_visa_details_choice'
+            new_session.context['data'] = type_visas
+        elif step == 'awaiting_visa_details_choice':
+            response_text_ar = self._format_visa_details(selected_item)
+        else:
+            return False
+
+        final_response_text = response_text_ar
+        if lang == 'en':
+            final_response_text = await self._translate_text_for_user(response_text_ar)
+
+        if 'step' in new_session.context and new_session.context['step'] == 'awaiting_visa_details_choice':
+            await self.db.update_user_session(sender_id, new_session)
+        else:
+            await self.db.update_user_session(sender_id, UserSession(state='bot', context={'lang': lang}))
+
+        await self.whatsapp.send_message(sender_id, final_response_text)
+        await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+        return True
+
+    def _handle_routine_message(self, message: str) -> Optional[str]:
+        message_lower = message.lower().strip()
+        for keywords, response in self.ROUTINE_RESPONSES.items():
+            if any(keyword == message_lower for keyword in keywords):
+                return response
+        return None
+
+    async def _initiate_human_handoff(self, sender_id: str, lang: str, reason: str):
+        log = logger.bind(user_id=sender_id)
+        log.info("Initiating human handoff.", reason=reason)
+        await self.db.update_user_session(sender_id, UserSession(state='human', context={}))
+        message = "أنا آسف، ولكن هذا الاستفسار يتطلب مساعدة من أحد زملائي. سيقومون بالتواصل معك قريباً."
+        try:
+            final_message = message
+            if lang == 'en':
+                final_message = await self._translate_text_for_user(message)
+            await self.whatsapp.send_message(sender_id, final_message)
+            await self._notify_employee(sender_id, reason)
+        except Exception as e:
+            log.error("Failed to send handoff notification or message", error=str(e))
+
+    def _is_country_search(self, term: str, all_flights: List[Dict], is_destination: bool) -> bool:
+        term_normalized = self._normalize_arabic(term.lower())
+        airport_column = 'destination_airport' if is_destination else 'depart_airport'
+        country_column = 'to_country' if is_destination else 'from_country'
+
+        for flight in all_flights:
+            if term_normalized == self._normalize_arabic(str(flight.get(airport_column, '')).lower()):
+                return False
+
+        for flight in all_flights:
+            if term_normalized == self._normalize_arabic(str(flight.get(country_column, '')).lower()):
+                return True
+        return False
+
+    def _normalize_arabic(self, text: str) -> str:
+        text = re.sub("[إأآا]", "ا", text)
+        text = re.sub("ى", "ي", text)
+        text = re.sub("ة", "ه", text)
+        text = re.sub(r'[\u064B-\u0652]', '', text)
+        return text
+
+    async def _notify_employee(self, customer_id: str, reason: str):
+        if not self.settings.EMPLOYEE_WHATSAPP_NUMBER:
+            logger.warning("EMPLOYEE_WHATSAPP_NUMBER is not set.")
+            return
+        notification_message = self.EMPLOYEE_NOTIFICATION_TEMPLATE.format(customer_id=customer_id, reason=reason)
+        await self.whatsapp.send_message(self.settings.EMPLOYEE_WHATSAPP_NUMBER, notification_message)
+
+    def _parse_date(self, date_str: str) -> Optional[datetime.date]:
+        formats_to_try = ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y']
+        for fmt in formats_to_try:
+            try:
+                return datetime.datetime.strptime(str(date_str), fmt).date()
+            except (ValueError, TypeError):
+                continue
+        return None
+
+    async def _send_summary_list(self, sender_id: str, session: UserSession, items: List[Any], title: str, step: str, formatter, lang: str):
+        if not items:
+            no_results_text_ar = f"عفواً، لا توجد {title} متاحة حالياً."
+            final_text = no_results_text_ar
+            if lang == 'en':
+                final_text = await self._translate_text_for_user(no_results_text_ar)
+            await self.whatsapp.send_message(sender_id, final_text)
+            await self.db.update_user_session(sender_id, UserSession(state='bot', context={'lang': lang}))
+            return
+
+        summary_lines = [f"أهلاً بك، هذه هي {title} المتوفرة لدينا حالياً:", ""]
+        summary_lines.extend([f"{i + 1}. {formatter(item)}" for i, item in enumerate(items)])
+        summary_lines.append("\nلمعرفة التفاصيل الكاملة، يرجى إرسال الرقم.")
+
+        response_text_ar = "\n".join(summary_lines)
+
+        final_response_text = response_text_ar
+        if lang == 'en':
+            final_response_text = await self._translate_text_for_user(response_text_ar)
+
+        session.context['step'] = step
+        session.context['data'] = items
+
+        await self.db.update_user_session(sender_id, session)
+        await self.whatsapp.send_message(sender_id, final_response_text)
+        await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+
+    def _strip_emojis(self, text: str) -> str:
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"
+            "\U0001F300-\U0001F5FF"
+            "\U0001F680-\U0001F6FF"
+            "\U0001F1E0-\U0001F1FF"
+            "\U00002702-\U000027B0"
+            "\U000024C2-\U0001F251"
+            "]+",
+            flags=re.UNICODE,
+        )
+        return emoji_pattern.sub(r'', text)
+
+    async def _translate_text_for_user(self, text_to_translate: str) -> str:
+        log = logger.bind(text_length=len(text_to_translate))
+        log.info("Translating text to English")
+        try:
+            messages = [
+                {"role": "system", "content": "You are a professional translator. Your task is to translate the following Arabic text to English for a travel agency's WhatsApp bot. The translation must be accurate, professional, and friendly. Preserve the WhatsApp markdown formatting (like *bold text*). Do not add any extra text or commentary, only provide the translation."},
+                {"role": "user", "content": text_to_translate}
+            ]
+
+            response = await self.openai.client.chat.completions.create(
+                model=self.settings.CHAT_MODEL,
+                messages=messages,
+                temperature=0.1
+            )
+            translated_text = response.choices[0].message.content
+            log.info("Text translated successfully")
+            return translated_text if translated_text else text_to_translate
+        except Exception as e:
+            log.error("Failed to translate text", error=str(e))
+            return text_to_translate
+
+    async def handle_incoming_message(self, sender_id: str, message_body: Optional[str]):
+        log = logger.bind(user_id=sender_id)
+
+        if 'g.us' in sender_id:
+            log.info("Ignoring group message.")
+            return
+
+        if not message_body:
+            log.info("Ignoring message with empty body (likely non-text).")
+            return
+
+        cleaned_body = self._strip_emojis(message_body).strip()
+        if not cleaned_body:
+            log.info("Ignoring message containing only emojis or whitespace.")
+            return
+
+        session = await self.db.get_user_session(sender_id)
+        stored_lang = session.context.get('lang')
+        lang = stored_lang or 'ar'
+
+        if len(cleaned_body) > 5:
+            detected_lang = self._detect_language(cleaned_body)
+            if detected_lang and detected_lang != stored_lang:
+                lang = detected_lang
+                session.context['lang'] = lang
+                await self.db.update_user_session(sender_id, session)
+
+        if session.state == 'human':
+            await self.db.add_message_to_history(sender_id, 'user', cleaned_body)
+            return
+
+        await self.db.add_message_to_history(sender_id, 'user', cleaned_body)
+
+        if await self._handle_numeric_choice(sender_id, cleaned_body, session, lang):
+            return
+
+        routine_response_ar = self._handle_routine_message(cleaned_body)
+        if routine_response_ar:
+            final_response = routine_response_ar
+            if lang == 'en':
+                final_response = await self._translate_text_for_user(routine_response_ar)
+            await self.whatsapp.send_message(sender_id, final_response)
+            await self.db.add_message_to_history(sender_id, 'assistant', final_response)
+            return
+
+        history = await self.db.get_recent_messages(sender_id, self.settings.OPENAI_CONTEXT_MESSAGES)
+        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}] + history
+
+        tools = [
+            {"type": "function", "function": {
+                "name": "find_service",
+                "description": "الأداة الرئيسية للبحث عن الخدمات المحددة مثل النقل البري، استخراج جوازات السفر، أو حجز المواعيد. استخدمها عندما لا يكون الطلب متعلقاً بالطيران أو الفيزا أو العروض السياحية.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service_category": {"type": "string", "description": "فئة الخدمة المطلوبة (مثلاً: نقل، جواز سفر، موعد سفارة)"},
+                        "origin": {"type": "string", "description": "نقطة الانطلاق (إذا كانت الخدمة تتطلب ذلك مثل النقل)"},
+                        "destination": {"type": "string", "description": "الوجهة (إذا كانت الخدمة تتطلب ذلك مثل النقل)"}
+                    }
+                }
+            }},
+            {"type": "function", "function": {"name": "list_offers", "description": "يعرض قائمة بالعروض السياحية والبكجات المتكاملة."}},
+            {"type": "function", "function": {"name": "list_umrah_packages", "description": "يعرض قائمة بباقات العمرة المتوفرة."}},
+            {"type": "function", "function": {"name": "get_all_company_info", "description": "للحصول على معلومات ثابتة عن الشركة."}},
+            {"type": "function", "function": {
+                "name": "get_available_destinations",
+                "description": "يستخدم لجلب قائمة بالوجهات المتاحة من مطار انطلاق معين عندما يطلب المستخدم اقتراحات.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "origin": {"type": "string", "description": "مطار أو مدينة الانطلاق"}
+                    },
+                    "required": ["origin"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "find_flights",
+                "description": "الأداة الرئيسية للبحث عن رحلات الطيران أو بدء حوار حجز رحلة.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "destination": {"type": "string", "description": "وجهة السفر (مدينة أو دولة)"},
+                        "origin": {"type": "string", "description": "نقطة الانطلاق (مدينة أو دولة)"},
+                        "depart_date": {"type": "string", "description": "تاريخ المغادرة بصيغة YYYY-MM-DD"}
+                    }
+                }
+            }},
+            {"type": "function", "function": {"name": "initiate_visa_discovery", "description": "يستخدم عندما يسأل المستخدم سؤالاً عاماً عن الفيزا.", "parameters": {"type": "object", "properties": {"topic": {"type": "string", "description": "حدد 'countries' إذا سأل عن الدول، أو 'types' إذا سأل عن أنواع الفيزا.", "enum": ["countries", "types"]}}, "required": ["topic"]}}},
+            {"type": "function", "function": {"name": "find_visa_details", "description": "للبحث عن تفاصيل الفيزا لدولة معينة.", "parameters": {"type": "object", "properties": {"country": {"type": "string", "description": "اسم الدولة"}}, "required": ["country"]}}}
+        ]
+
+        try:
+            response = await self.openai.get_ai_response(messages, tools)
+            response_message = response.choices[0].message
+
+            if response_message.tool_calls:
+                messages.append(response_message)
+                await self.handle_tool_call(sender_id, response_message.tool_calls[0], session, messages, lang)
+            else:
+                final_response_text = response_message.content
+                if lang == 'en' and self._detect_language(final_response_text) == 'ar':
+                    final_response_text = await self._translate_text_for_user(final_response_text)
+                await self.whatsapp.send_message(sender_id, final_response_text)
+                await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+
+        except Exception as e:
+            log.error("Error during message processing.", error=str(e), exc_info=True)
+            await self._initiate_human_handoff(sender_id, lang, "فشل فني في النظام.")
+
+    async def handle_tool_call(self, sender_id: str, tool_call: Any, session: UserSession, messages: List[Dict], lang: str):
+        function_name = tool_call.function.name
+        args = json.loads(tool_call.function.arguments)
+        log = logger.bind(user_id=sender_id, tool=function_name, args=args)
+        log.info("Handling tool call")
+
+        if function_name == 'find_service':
+            category = args.get('service_category', '')
+            origin = args.get('origin', '')
+            destination = args.get('destination', '')
+            log.info("Finding service", category=category, origin=origin, destination=destination)
+
+            all_services = self.sheets.get_data('services')
+            matching_services = [s for s in all_services if str(s.get('is_it_available', '')).lower() == 'نعم']
+
+            if category:
+                category_normalized = self._normalize_arabic(category.lower())
+                matching_services = [s for s in matching_services if category_normalized in self._normalize_arabic(str(s.get('category', '')).lower())]
+
+            if origin:
+                origin_normalized = self._normalize_arabic(origin.lower())
+                matching_services = [s for s in matching_services if self._normalize_arabic(str(s.get('origin', '')).lower()) == origin_normalized]
+
+            if destination:
+                destination_normalized = self._normalize_arabic(destination.lower())
+                matching_services = [s for s in matching_services if self._normalize_arabic(str(s.get('destination', '')).lower()) == destination_normalized]
+
+            if not matching_services:
+                no_results_text_ar = "عفواً، لا تتوفر لدينا هذه الخدمة حالياً."
+                final_text = no_results_text_ar
+                if lang == 'en':
+                    final_text = await self._translate_text_for_user(no_results_text_ar)
+                await self.whatsapp.send_message(sender_id, final_text)
+                return
+
+            if len(matching_services) == 1:
+                response_text_ar = self._format_service_details(matching_services[0])
+                final_response_text = response_text_ar
+                if lang == 'en':
+                    final_response_text = await self._translate_text_for_user(response_text_ar)
+                await self.whatsapp.send_message(sender_id, final_response_text)
+                await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+            else:
+                await self._send_summary_list(sender_id, session, matching_services, "الخدمات المطابقة لبحثك", "awaiting_service_choice", lambda item: item.get('service', 'N/A'), lang)
+
+        elif function_name == 'list_offers':
+            offers = self.sheets.get_data('offers')
+            await self._send_summary_list(sender_id, session, offers, "العروض السياحية", "awaiting_offer_choice", lambda item: item.get('name', 'N/A'), lang)
+
+        elif function_name == 'list_umrah_packages':
+            packages = self.sheets.get_data('umrah')
+            await self._send_summary_list(sender_id, session, packages, "باقات العمرة", "awaiting_umrah_choice", lambda item: item.get('name_and_type', 'N/A'), lang)
+
+        elif function_name == 'get_all_company_info':
+            all_info = self.sheets.get_data('informations')
+            info_content = json.dumps(all_info, ensure_ascii=False)
+
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": function_name, "content": info_content})
+
+            response = await self.openai.client.chat.completions.create(model=self.settings.CHAT_MODEL, messages=messages)
+            response_text = response.choices[0].message.content
+
+            await self.whatsapp.send_message(sender_id, response_text)
+            await self.db.add_message_to_history(sender_id, 'assistant', response_text)
+
+        elif function_name == 'get_available_destinations':
+            origin = args.get('origin')
+            origin_normalized = self._normalize_arabic(origin.lower())
+            all_flights = self.sheets.get_data('flights')
+
+            destinations = sorted(list(set(
+                f.get('destination_airport') for f in all_flights
+                if self._normalize_arabic(str(f.get('depart_airport', '')).lower()) == origin_normalized
+                and f.get('destination_airport')
+            )))
+
+            dest_content = json.dumps(destinations, ensure_ascii=False)
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": function_name, "content": dest_content})
+
+            response = await self.openai.client.chat.completions.create(model=self.settings.CHAT_MODEL, messages=messages)
+            response_text = response.choices[0].message.content
+
+            await self.whatsapp.send_message(sender_id, response_text)
+            await self.db.add_message_to_history(sender_id, 'assistant', response_text)
+
+        elif function_name == 'find_flights':
+            destination = args.get('destination', '')
+            origin = args.get('origin', '')
+            destination_normalized = self._normalize_arabic(destination.lower())
+            origin_normalized = self._normalize_arabic(origin.lower())
+            date_str = args.get('depart_date')
+            all_flights = self.sheets.get_data('flights')
+
+            today = datetime.date.today()
+            future_flights = []
+            for f in all_flights:
+                depart_date = self._parse_date(f.get('depart_date'))
+                if depart_date and depart_date >= today:
+                    future_flights.append(f)
+                elif depart_date is None and f.get('depart_date'):
+                    future_flights.append(f)
+
+            matching_flights = []
+            if self._is_country_search(destination, all_flights, is_destination=True):
+                matching_flights = [f for f in future_flights if destination_normalized in self._normalize_arabic(str(f.get('to_country', '')).lower())]
+            else:
+                matching_flights = [f for f in future_flights if destination_normalized in self._normalize_arabic(str(f.get('destination_airport', '')).lower())]
+
+            if origin_normalized:
+                if self._is_country_search(origin, all_flights, is_destination=False):
+                    matching_flights = [f for f in matching_flights if origin_normalized in self._normalize_arabic(str(f.get('from_country', '')).lower())]
+                else:
+                    matching_flights = [f for f in matching_flights if origin_normalized in self._normalize_arabic(str(f.get('depart_airport', '')).lower())]
+
+            if date_str:
+                requested_date = self._parse_date(date_str)
+                if requested_date:
+                    date_matching_flights = [f for f in matching_flights if self._parse_date(f.get('depart_date')) == requested_date]
+                    if date_matching_flights:
+                        matching_flights = date_matching_flights
+                    else:
+                        sortable_flights = []
+                        for f in matching_flights:
+                            d = self._parse_date(f.get('depart_date'))
+                            if d:
+                                sortable_flights.append((f, abs(d - requested_date)))
+
+                        sortable_flights.sort(key=lambda x: x[1])
+                        nearest_flights = [item[0] for item in sortable_flights[:3]]
+
+                        if not nearest_flights:
+                            no_flights_text_ar = f"عفواً، لا توجد رحلات متاحة إلى *{destination}* في المستقبل القريب."
+                            final_text = no_flights_text_ar
+                            if lang == 'en':
+                                final_text = await self._translate_text_for_user(no_flights_text_ar)
+                            await self.whatsapp.send_message(sender_id, final_text)
+                            return
+
+                        summary_lines_ar = [f"عفواً، لا توجد رحلات متاحة إلى *{destination}* في التاريخ المطلوب.", "لكن، وجدنا لك أقرب الرحلات المتوفرة:", ""]
+                        summary_lines_ar.extend([f"{i + 1}. {self._flight_formatter(item)}" for i, item in enumerate(nearest_flights)])
+                        summary_lines_ar.append("\nلمعرفة التفاصيل الكاملة لأي رحلة، يرجى إرسال رقمها.")
+                        response_text_ar = "\n".join(summary_lines_ar)
+
+                        final_response_text = response_text_ar
+                        if lang == 'en':
+                            final_response_text = await self._translate_text_for_user(response_text_ar)
+
+                        session.context['step'] = 'awaiting_flight_choice'
+                        session.context['data'] = nearest_flights
+                        await self.db.update_user_session(sender_id, session)
+                        await self.whatsapp.send_message(sender_id, final_response_text)
+                        await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+                        return
+
+            title = f"الرحلات القادمة من {origin} إلى {destination}" if origin else f"الرحلات القادمة إلى {destination}"
+            await self._send_summary_list(sender_id, session, matching_flights, title, "awaiting_flight_choice", self._flight_formatter, lang)
+
+        elif function_name == 'initiate_visa_discovery':
+            topic = args.get('topic')
+            all_visas = self.sheets.get_data('visas')
+            if topic == 'countries':
+                countries = sorted(list(set(v['country'] for v in all_visas if v.get('country'))))
+                await self._send_summary_list(sender_id, session, countries, "الدول التي نوفر لها فيزا", "awaiting_visa_country_choice", lambda item: item, lang)
+            elif topic == 'types':
+                types = sorted(list(set(v['type'] for v in all_visas if v.get('type'))))
+                await self._send_summary_list(sender_id, session, types, "أنواع الفيزا المتوفرة", "awaiting_visa_type_choice", lambda item: item, lang)
+
+        elif function_name == 'find_visa_details':
+            country_normalized = self._normalize_arabic(args.get('country', '').lower())
+            all_visas = self.sheets.get_data('visas')
+            visas = [v for v in all_visas if self._normalize_arabic(str(v.get('country', '')).lower()) == country_normalized]
+
+            if not visas:
+                no_visa_text_ar = f"عفواً، لا توجد معلومات عن فيزا لدولة *{args.get('country')}*."
+                final_text = no_visa_text_ar
+                if lang == 'en':
+                    final_text = await self._translate_text_for_user(no_visa_text_ar)
+                await self.whatsapp.send_message(sender_id, final_text)
+                return
+
+            if len(visas) == 1:
+                response_text_ar = self._format_visa_details(visas[0])
+                final_response_text = response_text_ar
+                if lang == 'en':
+                    final_response_text = await self._translate_text_for_user(response_text_ar)
+                await self.whatsapp.send_message(sender_id, final_response_text)
+                await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+            else:
+                summary_lines = [f"اختر نوع الفيزا لدولة *{args.get('country')}*:", ""]
+                for i, visa in enumerate(visas):
+                    validity = f"- (صالحة لمدة) {visa['valid_until']}" if visa.get('valid_until') else ""
+                    summary_lines.append(f"{i + 1}. {visa.get('type', 'N/A')} {validity}")
+                summary_lines.append("\nلمعرفة التفاصيل الكاملة، يرجى إرسال الرقم.")
+                response_text_ar = "\n".join(summary_lines)
+
+                final_response_text = response_text_ar
+                if lang == 'en':
+                    final_response_text = await self._translate_text_for_user(response_text_ar)
+
+                session.context['step'] = 'awaiting_visa_details_choice'
+                session.context['data'] = visas
+                await self.db.update_user_session(sender_id, session)
+                await self.whatsapp.send_message(sender_id, final_response_text)
+                await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+
+    async def pause_bot_for_user(self, user_number: str):
+        await self.db.update_user_session(user_number, UserSession(state='human', context={}))
+        logger.info(f"Bot paused for user {user_number} by in-chat command.")
+        confirmation_message = "تم إيقاف المساعد الآلي. يمكنك الآن التحدث مباشرة مع الموظف"
+        await self.whatsapp.send_message(user_number, confirmation_message)
+
+    async def resume_bot_for_user(self, user_number: str):
+        await self.db.update_user_session(user_number, UserSession(state='bot', context={}))
+        logger.info(f"Bot resumed for user {user_number} by in-chat command.")
+        last_message = await self.db.get_last_user_message_content(user_number)
+        lang = self._detect_language(last_message or 'ar')
+        resume_message = "المساعد الآلي عاد لخدمتك."
+        final_message = resume_message
+        if lang == 'en':
+            final_message = await self._translate_text_for_user(resume_message)
+        await self.whatsapp.send_message(user_number, final_message)
