@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import structlog
-from langdetect import detect, LangDetectException
+from langdetect import LangDetectException, detect
 from pydantic import BaseModel
 
 from app.config import Settings
@@ -353,15 +353,9 @@ class ConversationManager:
             return
 
         session = await self.db.get_user_session(sender_id)
-        stored_lang = session.context.get('lang')
-        lang = stored_lang or 'ar'
-
-        if len(cleaned_body) > 5:
-            detected_lang = self._detect_language(cleaned_body)
-            if detected_lang and detected_lang != stored_lang:
-                lang = detected_lang
-                session.context['lang'] = lang
-                await self.db.update_user_session(sender_id, session)
+        lang = 'ar'
+        session.context['lang'] = lang
+        await self.db.update_user_session(sender_id, session)
 
         if session.state == 'human':
             await self.db.add_message_to_history(sender_id, 'user', cleaned_body)
@@ -374,11 +368,8 @@ class ConversationManager:
 
         routine_response_ar = self._handle_routine_message(cleaned_body)
         if routine_response_ar:
-            final_response = routine_response_ar
-            if lang == 'en':
-                final_response = await self._translate_text_for_user(routine_response_ar)
-            await self.whatsapp.send_message(sender_id, final_response)
-            await self.db.add_message_to_history(sender_id, 'assistant', final_response)
+            await self.whatsapp.send_message(sender_id, routine_response_ar)
+            await self.db.add_message_to_history(sender_id, 'assistant', routine_response_ar)
             return
 
         history = await self.db.get_recent_messages(sender_id, self.settings.OPENAI_CONTEXT_MESSAGES)
@@ -419,12 +410,27 @@ class ConversationManager:
                     "properties": {
                         "destination": {"type": "string", "description": "وجهة السفر (مدينة أو دولة)"},
                         "origin": {"type": "string", "description": "نقطة الانطلاق (مدينة أو دولة)"},
-                        "depart_date": {"type": "string", "description": "تاريخ المغادرة بصيغة YYYY-MM-DD"}
+                        "time_query": {"type": "string", "description": "استعلام الوقت كما يعبر عنه المستخدم بالضبط (مثال: 'الأسبوع القادم'، 'بعد غد'، 'رحلات آخر الشهر'، 'يومي')."}
                     }
                 }
             }},
             {"type": "function", "function": {"name": "initiate_visa_discovery", "description": "يستخدم عندما يسأل المستخدم سؤالاً عاماً عن الفيزا.", "parameters": {"type": "object", "properties": {"topic": {"type": "string", "description": "حدد 'countries' إذا سأل عن الدول، أو 'types' إذا سأل عن أنواع الفيزا.", "enum": ["countries", "types"]}}, "required": ["topic"]}}},
-            {"type": "function", "function": {"name": "find_visa_details", "description": "للبحث عن تفاصيل الفيزا لدولة معينة.", "parameters": {"type": "object", "properties": {"country": {"type": "string", "description": "اسم الدولة"}}, "required": ["country"]}}}
+            {"type": "function", "function": {"name": "find_visa_details", "description": "للبحث عن تفاصيل الفيزا لدولة معينة.", "parameters": {"type": "object", "properties": {"country": {"type": "string", "description": "اسم الدولة"}}, "required": ["country"]}}},
+            {"type": "function", "function": {
+                "name": "initiate_human_handoff",
+                "description": "تستخدم هذه الأداة *فقط* عندما يطلب المستخدم بوضوح التحدث إلى موظف أو عندما يستفسر عن أمور تتطلب تدخلاً بشرياً إلزامياً.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "سبب التحويل. يجب أن يكون واحداً من القيم التالية بناءً على طلب المستخدم.",
+                            "enum": ["تثبيت حجز تذكرة", "تثبيت عرض", "تثبيت عمرة", "تثبيت خدمة", "طلب مساعدة مباشرة", "استفسار عن سعر", "استئجار سيارة"]
+                        }
+                    },
+                    "required": ["reason"]
+                }
+            }}
         ]
 
         try:
@@ -436,8 +442,6 @@ class ConversationManager:
                 await self.handle_tool_call(sender_id, response_message.tool_calls[0], session, messages, lang)
             else:
                 final_response_text = response_message.content
-                if lang == 'en' and self._detect_language(final_response_text) == 'ar':
-                    final_response_text = await self._translate_text_for_user(final_response_text)
                 await self.whatsapp.send_message(sender_id, final_response_text)
                 await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
 
@@ -451,7 +455,11 @@ class ConversationManager:
         log = logger.bind(user_id=sender_id, tool=function_name, args=args)
         log.info("Handling tool call")
 
-        if function_name == 'find_service':
+        if function_name == 'initiate_human_handoff':
+            reason = args.get('reason', 'طلب المستخدم التحدث إلى موظف')
+            await self._initiate_human_handoff(sender_id, lang, reason)
+
+        elif function_name == 'find_service':
             category = args.get('service_category', '')
             origin = args.get('origin', '')
             destination = args.get('destination', '')
@@ -474,19 +482,13 @@ class ConversationManager:
 
             if not matching_services:
                 no_results_text_ar = "عفواً، لا تتوفر لدينا هذه الخدمة حالياً."
-                final_text = no_results_text_ar
-                if lang == 'en':
-                    final_text = await self._translate_text_for_user(no_results_text_ar)
-                await self.whatsapp.send_message(sender_id, final_text)
+                await self.whatsapp.send_message(sender_id, no_results_text_ar)
                 return
 
             if len(matching_services) == 1:
                 response_text_ar = self._format_service_details(matching_services[0])
-                final_response_text = response_text_ar
-                if lang == 'en':
-                    final_response_text = await self._translate_text_for_user(response_text_ar)
-                await self.whatsapp.send_message(sender_id, final_response_text)
-                await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+                await self.whatsapp.send_message(sender_id, response_text_ar)
+                await self.db.add_message_to_history(sender_id, 'assistant', response_text_ar)
             else:
                 await self._send_summary_list(sender_id, session, matching_services, "الخدمات المطابقة لبحثك", "awaiting_service_choice", lambda item: item.get('service', 'N/A'), lang)
 
@@ -533,71 +535,55 @@ class ConversationManager:
         elif function_name == 'find_flights':
             destination = args.get('destination', '')
             origin = args.get('origin', '')
+            time_query = args.get('time_query', '')
             destination_normalized = self._normalize_arabic(destination.lower())
             origin_normalized = self._normalize_arabic(origin.lower())
-            date_str = args.get('depart_date')
             all_flights = self.sheets.get_data('flights')
 
-            today = datetime.date.today()
-            future_flights = []
-            for f in all_flights:
-                depart_date = self._parse_date(f.get('depart_date'))
-                if depart_date and depart_date >= today:
-                    future_flights.append(f)
-                elif depart_date is None and f.get('depart_date'):
-                    future_flights.append(f)
-
-            matching_flights = []
-            if self._is_country_search(destination, all_flights, is_destination=True):
-                matching_flights = [f for f in future_flights if destination_normalized in self._normalize_arabic(str(f.get('to_country', '')).lower())]
-            else:
-                matching_flights = [f for f in future_flights if destination_normalized in self._normalize_arabic(str(f.get('destination_airport', '')).lower())]
+            filtered_flights = all_flights
+            if destination_normalized:
+                if self._is_country_search(destination, all_flights, is_destination=True):
+                    filtered_flights = [f for f in filtered_flights if destination_normalized in self._normalize_arabic(str(f.get('to_country', '')).lower())]
+                else:
+                    filtered_flights = [f for f in filtered_flights if destination_normalized in self._normalize_arabic(str(f.get('destination_airport', '')).lower())]
 
             if origin_normalized:
                 if self._is_country_search(origin, all_flights, is_destination=False):
-                    matching_flights = [f for f in matching_flights if origin_normalized in self._normalize_arabic(str(f.get('from_country', '')).lower())]
+                    filtered_flights = [f for f in filtered_flights if origin_normalized in self._normalize_arabic(str(f.get('from_country', '')).lower())]
                 else:
-                    matching_flights = [f for f in matching_flights if origin_normalized in self._normalize_arabic(str(f.get('depart_airport', '')).lower())]
+                    filtered_flights = [f for f in filtered_flights if origin_normalized in self._normalize_arabic(str(f.get('depart_airport', '')).lower())]
 
-            if date_str:
-                requested_date = self._parse_date(date_str)
-                if requested_date:
-                    date_matching_flights = [f for f in matching_flights if self._parse_date(f.get('depart_date')) == requested_date]
-                    if date_matching_flights:
-                        matching_flights = date_matching_flights
+            matching_flights = []
+            if time_query and filtered_flights:
+                flights_json = json.dumps(filtered_flights, ensure_ascii=False)
+                today_date = datetime.date.today().isoformat()
+                filtering_prompt = (
+                    f"أنت خبير في تحليل البيانات. أمامك قائمة رحلات طيران بصيغة JSON. مهمتك هي ترشيح هذه القائمة بناءً على طلب المستخدم الزمني."
+                    f"\n\n- تاريخ اليوم هو: {today_date}"
+                    f"\n- طلب المستخدم الزمني هو: '{time_query}'"
+                    f"\n- بيانات الرحلات: {flights_json}"
+                    f"\n\nالرجاء إعادة قائمة JSON تحتوي فقط على الرحلات التي تتطابق بدقة مع طلب المستخدم. إذا لم توجد أي رحلات مطابقة، أعد قائمة فارغة []."
+                )
+
+                response = await self.openai.client.chat.completions.create(
+                    model=self.settings.CHAT_MODEL,
+                    messages=[{"role": "system", "content": filtering_prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0.0
+                )
+                try:
+                    response_content = response.choices[0].message.content
+                    json_match = re.search(r'\[.*\]', response_content, re.DOTALL)
+                    if json_match:
+                        matching_flights = json.loads(json_match.group(0))
                     else:
-                        sortable_flights = []
-                        for f in matching_flights:
-                            d = self._parse_date(f.get('depart_date'))
-                            if d:
-                                sortable_flights.append((f, abs(d - requested_date)))
-
-                        sortable_flights.sort(key=lambda x: x[1])
-                        nearest_flights = [item[0] for item in sortable_flights[:3]]
-
-                        if not nearest_flights:
-                            no_flights_text_ar = f"عفواً، لا توجد رحلات متاحة إلى *{destination}* في المستقبل القريب."
-                            final_text = no_flights_text_ar
-                            if lang == 'en':
-                                final_text = await self._translate_text_for_user(no_flights_text_ar)
-                            await self.whatsapp.send_message(sender_id, final_text)
-                            return
-
-                        summary_lines_ar = [f"عفواً، لا توجد رحلات متاحة إلى *{destination}* في التاريخ المطلوب.", "لكن، وجدنا لك أقرب الرحلات المتوفرة:", ""]
-                        summary_lines_ar.extend([f"{i + 1}. {self._flight_formatter(item)}" for i, item in enumerate(nearest_flights)])
-                        summary_lines_ar.append("\nلمعرفة التفاصيل الكاملة لأي رحلة، يرجى إرسال رقمها.")
-                        response_text_ar = "\n".join(summary_lines_ar)
-
-                        final_response_text = response_text_ar
-                        if lang == 'en':
-                            final_response_text = await self._translate_text_for_user(response_text_ar)
-
-                        session.context['step'] = 'awaiting_flight_choice'
-                        session.context['data'] = nearest_flights
-                        await self.db.update_user_session(sender_id, session)
-                        await self.whatsapp.send_message(sender_id, final_response_text)
-                        await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
-                        return
+                        logger.warning("AI did not return a valid JSON list for flight filtering.", raw_response=response_content)
+                        matching_flights = []
+                except (json.JSONDecodeError, IndexError) as e:
+                    logger.error("Failed to parse AI response for flight filtering", error=str(e), raw_response=response.choices[0].message.content)
+                    matching_flights = []
+            else:
+                matching_flights = filtered_flights
 
             title = f"الرحلات القادمة من {origin} إلى {destination}" if origin else f"الرحلات القادمة إلى {destination}"
             await self._send_summary_list(sender_id, session, matching_flights, title, "awaiting_flight_choice", self._flight_formatter, lang)
@@ -619,19 +605,13 @@ class ConversationManager:
 
             if not visas:
                 no_visa_text_ar = f"عفواً، لا توجد معلومات عن فيزا لدولة *{args.get('country')}*."
-                final_text = no_visa_text_ar
-                if lang == 'en':
-                    final_text = await self._translate_text_for_user(no_visa_text_ar)
-                await self.whatsapp.send_message(sender_id, final_text)
+                await self.whatsapp.send_message(sender_id, no_visa_text_ar)
                 return
 
             if len(visas) == 1:
                 response_text_ar = self._format_visa_details(visas[0])
-                final_response_text = response_text_ar
-                if lang == 'en':
-                    final_response_text = await self._translate_text_for_user(response_text_ar)
-                await self.whatsapp.send_message(sender_id, final_response_text)
-                await self.db.add_message_to_history(sender_id, 'assistant', final_response_text)
+                await self.whatsapp.send_message(sender_id, response_text_ar)
+                await self.db.add_message_to_history(sender_id, 'assistant', response_text_ar)
             else:
                 summary_lines = [f"اختر نوع الفيزا لدولة *{args.get('country')}*:", ""]
                 for i, visa in enumerate(visas):
