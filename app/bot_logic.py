@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 from langdetect import LangDetectException, detect
-from pydantic import BaseModel
 
 from app.config import Settings
 from app.database import DatabaseService
@@ -207,7 +206,7 @@ class ConversationManager:
         if lang == 'en':
             final_response_text = await self._translate_text_for_user(response_text_ar)
 
-        if 'step' in new_session.context and new_session.context['step'] == 'awaiting_visa_details_choice':
+        if 'step' in new_session.context and new_session.context['step'] in ['awaiting_visa_details_choice', 'awaiting_visa_country_choice', 'awaiting_visa_type_choice']:
             await self.db.update_user_session(sender_id, new_session)
         else:
             await self.db.update_user_session(sender_id, UserSession(state='bot', context={'lang': lang}))
@@ -223,17 +222,34 @@ class ConversationManager:
                 return response
         return None
 
-    async def _initiate_human_handoff(self, sender_id: str, lang: str, reason: str):
+    async def _initiate_human_handoff(self, sender_id: str, lang: str, reason: str, details: Optional[str] = None):
         log = logger.bind(user_id=sender_id)
-        log.info("Initiating human handoff.", reason=reason)
+        log.info("Initiating human handoff.", reason=reason, details=details)
         await self.db.update_user_session(sender_id, UserSession(state='human', context={}))
-        message = "أنا آسف، ولكن هذا الاستفسار يتطلب مساعدة من أحد زملائي. سيقومون بالتواصل معك قريباً."
+
         try:
+            details_text = f" بخصوص '{details}'" if details else ""
+            handoff_prompt = (
+                f"أنت مساعد آلي ودود ومتعاون في شركة 'العسل للسياحة والسفر'. "
+                f"مهمتك هي كتابة رسالة قصيرة ولطيفة لإبلاغ العميل بأنه سيتم تحويله الآن إلى موظف بشري. "
+                f"السبب هو '{reason}'{details_text}. "
+                f"اكتب رسالة طبيعية ومطمئنة باللغة العربية، تشرح فيها أن الموظف سيتابع معه لإكمال طلبه."
+            )
+
+            response = await self.openai.client.chat.completions.create(
+                model=self.settings.CHAT_MODEL,
+                messages=[{"role": "system", "content": handoff_prompt}],
+                temperature=0.7,
+                max_tokens=100
+            )
+            message = response.choices[0].message.content.strip()
+
             final_message = message
             if lang == 'en':
                 final_message = await self._translate_text_for_user(message)
             await self.whatsapp.send_message(sender_id, final_message)
-            await self._notify_employee(sender_id, reason)
+            notification_reason = f"{reason}: {details}" if details else reason
+            await self._notify_employee(sender_id, notification_reason)
         except Exception as e:
             log.error("Failed to send handoff notification or message", error=str(e))
 
@@ -376,61 +392,16 @@ class ConversationManager:
         messages = [{"role": "system", "content": self.SYSTEM_PROMPT}] + history
 
         tools = [
-            {"type": "function", "function": {
-                "name": "find_service",
-                "description": "الأداة الرئيسية للبحث عن الخدمات المحددة مثل النقل البري، استخراج جوازات السفر، أو حجز المواعيد. استخدمها عندما لا يكون الطلب متعلقاً بالطيران أو الفيزا أو العروض السياحية.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "service_category": {"type": "string", "description": "فئة الخدمة المطلوبة (مثلاً: نقل، جواز سفر، موعد سفارة)"},
-                        "origin": {"type": "string", "description": "نقطة الانطلاق (إذا كانت الخدمة تتطلب ذلك مثل النقل)"},
-                        "destination": {"type": "string", "description": "الوجهة (إذا كانت الخدمة تتطلب ذلك مثل النقل)"}
-                    }
-                }
-            }},
-            {"type": "function", "function": {"name": "list_offers", "description": "يعرض قائمة بالعروض السياحية والبكجات المتكاملة."}},
-            {"type": "function", "function": {"name": "list_umrah_packages", "description": "يعرض قائمة بباقات العمرة المتوفرة."}},
+            {"type": "function", "function": {"name": "list_services", "description": "تستخدم *فقط* عندما يسأل المستخدم سؤالاً عاماً عن الخدمات المتوفرة، مثل 'ما هي خدماتكم؟' أو 'شو عندكم خدمات؟'."}},
+            {"type": "function", "function": {"name": "find_service", "description": "تستخدم للبحث عن خدمة *محددة* عندما يذكر المستخدم تفاصيل عنها. لا تستخدمها للأسئلة العامة عن الخدمات.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "نص البحث الذي يصف الخدمة المطلوبة. مثال: 'سيارة للإيجار' أو 'تجديد جواز السفر'"}}, "required": ["query"]}}},
+            {"type": "function", "function": {"name": "list_offers", "description": "تستخدم *فقط* عندما يسأل المستخدم سؤالاً عاماً عن العروض، مثل 'ما هي عروضكم؟'."}},
+            {"type": "function", "function": {"name": "list_umrah_packages", "description": "تستخدم *فقط* عندما يسأل المستخدم سؤالاً عاماً عن باقات العمرة."}},
             {"type": "function", "function": {"name": "get_all_company_info", "description": "للحصول على معلومات ثابتة عن الشركة."}},
-            {"type": "function", "function": {
-                "name": "get_available_destinations",
-                "description": "يستخدم لجلب قائمة بالوجهات المتاحة من مطار انطلاق معين عندما يطلب المستخدم اقتراحات.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "origin": {"type": "string", "description": "مطار أو مدينة الانطلاق"}
-                    },
-                    "required": ["origin"]
-                }
-            }},
-            {"type": "function", "function": {
-                "name": "find_flights",
-                "description": "الأداة الرئيسية للبحث عن رحلات الطيران أو بدء حوار حجز رحلة.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "destination": {"type": "string", "description": "وجهة السفر (مدينة أو دولة)"},
-                        "origin": {"type": "string", "description": "نقطة الانطلاق (مدينة أو دولة)"},
-                        "time_query": {"type": "string", "description": "استعلام الوقت كما يعبر عنه المستخدم بالضبط (مثال: 'الأسبوع القادم'، 'بعد غد'، 'رحلات آخر الشهر'، 'يومي')."}
-                    }
-                }
-            }},
+            {"type": "function", "function": {"name": "list_flights", "description": "تستخدم *فقط* عندما يسأل المستخدم سؤالاً عاماً عن رحلات الطيران المتوفرة دون تحديد وجهة أو تاريخ."}},
+            {"type": "function", "function": {"name": "find_flights", "description": "تستخدم للبحث عن رحلات طيران *محددة* بناءً على وجهة أو تاريخ.", "parameters": {"type": "object", "properties": {"destination": {"type": "string", "description": "وجهة السفر (مدينة أو دولة)"}, "origin": {"type": "string", "description": "نقطة الانطلاق (مدينة أو دولة)"}, "time_query": {"type": "string", "description": "استعلام الوقت كما يعبر عنه المستخدم بالضبط (مثال: 'الأسبوع القادم'، 'بعد غد'، 'رحلات آخر الشهر'، 'يومي')."}}, "required": ["destination"]}}},
             {"type": "function", "function": {"name": "initiate_visa_discovery", "description": "يستخدم عندما يسأل المستخدم سؤالاً عاماً عن الفيزا.", "parameters": {"type": "object", "properties": {"topic": {"type": "string", "description": "حدد 'countries' إذا سأل عن الدول، أو 'types' إذا سأل عن أنواع الفيزا.", "enum": ["countries", "types"]}}, "required": ["topic"]}}},
             {"type": "function", "function": {"name": "find_visa_details", "description": "للبحث عن تفاصيل الفيزا لدولة معينة.", "parameters": {"type": "object", "properties": {"country": {"type": "string", "description": "اسم الدولة"}}, "required": ["country"]}}},
-            {"type": "function", "function": {
-                "name": "initiate_human_handoff",
-                "description": "تستخدم هذه الأداة *فقط* عندما يطلب المستخدم بوضوح التحدث إلى موظف أو عندما يستفسر عن أمور تتطلب تدخلاً بشرياً إلزامياً.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {
-                            "type": "string",
-                            "description": "سبب التحويل. يجب أن يكون واحداً من القيم التالية بناءً على طلب المستخدم.",
-                            "enum": ["تثبيت حجز تذكرة", "تثبيت عرض", "تثبيت عمرة", "تثبيت خدمة", "طلب مساعدة مباشرة", "استفسار عن سعر", "استئجار سيارة"]
-                        }
-                    },
-                    "required": ["reason"]
-                }
-            }}
+            {"type": "function", "function": {"name": "initiate_human_handoff", "description": "تستخدم هذه الأداة *فقط* عندما يطلب المستخدم بوضوح التحدث إلى موظف أو عندما يستفسر عن أمور تتطلب تدخلاً بشرياً إلزامياً مثل تثبيت الحجوزات.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "description": "سبب التحويل. يجب أن يكون واحداً من القيم التالية بناءً على طلب المستخدم.", "enum": ["تثبيت حجز تذكرة", "تثبيت عرض", "تثبيت عمرة", "تثبيت خدمة", "طلب مساعدة مباشرة", "استفسار عن سعر"]}, "details": {"type": "string", "description": "تفاصيل إضافية حول الطلب. إذا كان الطلب هو تثبيت خدمة، يجب أن يحتوي هذا الحقل على اسم الخدمة. مثال: 'سيارة هيونداي توسان' أو 'رحلة إلى دبي'."}}, "required": ["reason"]}}}
         ]
 
         try:
@@ -457,28 +428,52 @@ class ConversationManager:
 
         if function_name == 'initiate_human_handoff':
             reason = args.get('reason', 'طلب المستخدم التحدث إلى موظف')
-            await self._initiate_human_handoff(sender_id, lang, reason)
+            details = args.get('details')
+            await self._initiate_human_handoff(sender_id, lang, reason, details)
+
+        elif function_name == 'list_services':
+            log.info("Listing all available services")
+            all_services = self.sheets.get_data('services')
+            available_services = [s for s in all_services if str(s.get('is_it_available', '')).lower() == 'نعم']
+            await self._send_summary_list(sender_id, session, available_services, "الخدمات المتوفرة", "awaiting_service_choice", lambda item: item.get('service', 'N/A'), lang)
 
         elif function_name == 'find_service':
-            category = args.get('service_category', '')
-            origin = args.get('origin', '')
-            destination = args.get('destination', '')
-            log.info("Finding service", category=category, origin=origin, destination=destination)
+            query = args.get('query', '')
+            log.info("Finding service with AI-powered search", query=query)
 
             all_services = self.sheets.get_data('services')
-            matching_services = [s for s in all_services if str(s.get('is_it_available', '')).lower() == 'نعم']
+            available_services = [s for s in all_services if str(s.get('is_it_available', '')).lower() == 'نعم']
 
-            if category:
-                category_normalized = self._normalize_arabic(category.lower())
-                matching_services = [s for s in matching_services if category_normalized in self._normalize_arabic(str(s.get('category', '')).lower())]
+            if not available_services:
+                no_results_text_ar = "عفواً، لا تتوفر لدينا أي خدمات حالياً."
+                await self.whatsapp.send_message(sender_id, no_results_text_ar)
+                return
 
-            if origin:
-                origin_normalized = self._normalize_arabic(origin.lower())
-                matching_services = [s for s in matching_services if self._normalize_arabic(str(s.get('origin', '')).lower()) == origin_normalized]
+            services_json = json.dumps(available_services, ensure_ascii=False)
+            filtering_prompt = (
+                f"أنت خبير في مطابقة خدمات السفر. مهمتك هي تحليل طلب المستخدم وإيجاد أفضل خدمة مطابقة له من قائمة الخدمات المتوفرة."
+                f"\n\n- طلب المستخدم هو: '{query}'"
+                f"\n- قائمة الخدمات (JSON): {services_json}"
+                f"\n\nالرجاء إعادة قائمة JSON تحتوي *فقط* على الخدمة (أو الخدمات) التي تلبي طلب المستخدم بشكل مباشر. إذا لم تكن هناك خدمة مطابقة تماماً، أعد قائمة فارغة []."
+            )
 
-            if destination:
-                destination_normalized = self._normalize_arabic(destination.lower())
-                matching_services = [s for s in matching_services if self._normalize_arabic(str(s.get('destination', '')).lower()) == destination_normalized]
+            response = await self.openai.client.chat.completions.create(
+                model=self.settings.CHAT_MODEL,
+                messages=[{"role": "system", "content": filtering_prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+
+            matching_services = []
+            try:
+                response_content = response.choices[0].message.content
+                json_match = re.search(r'\[.*\]', response_content, re.DOTALL)
+                if json_match:
+                    matching_services = json.loads(json_match.group(0))
+                else:
+                    logger.warning("AI did not return a valid JSON list for service filtering.", raw_response=response_content)
+            except (json.JSONDecodeError, IndexError) as e:
+                logger.error("Failed to parse AI response for service filtering", error=str(e), raw_response=response.choices[0].message.content)
 
             if not matching_services:
                 no_results_text_ar = "عفواً، لا تتوفر لدينا هذه الخدمة حالياً."
@@ -500,31 +495,15 @@ class ConversationManager:
             packages = self.sheets.get_data('umrah')
             await self._send_summary_list(sender_id, session, packages, "باقات العمرة", "awaiting_umrah_choice", lambda item: item.get('name_and_type', 'N/A'), lang)
 
+        elif function_name == 'list_flights':
+            flights = self.sheets.get_data('flights')
+            await self._send_summary_list(sender_id, session, flights, "رحلات الطيران", "awaiting_flight_choice", self._flight_formatter, lang)
+
         elif function_name == 'get_all_company_info':
             all_info = self.sheets.get_data('informations')
             info_content = json.dumps(all_info, ensure_ascii=False)
 
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": function_name, "content": info_content})
-
-            response = await self.openai.client.chat.completions.create(model=self.settings.CHAT_MODEL, messages=messages)
-            response_text = response.choices[0].message.content
-
-            await self.whatsapp.send_message(sender_id, response_text)
-            await self.db.add_message_to_history(sender_id, 'assistant', response_text)
-
-        elif function_name == 'get_available_destinations':
-            origin = args.get('origin')
-            origin_normalized = self._normalize_arabic(origin.lower())
-            all_flights = self.sheets.get_data('flights')
-
-            destinations = sorted(list(set(
-                f.get('destination_airport') for f in all_flights
-                if self._normalize_arabic(str(f.get('depart_airport', '')).lower()) == origin_normalized
-                and f.get('destination_airport')
-            )))
-
-            dest_content = json.dumps(destinations, ensure_ascii=False)
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": function_name, "content": dest_content})
 
             response = await self.openai.client.chat.completions.create(model=self.settings.CHAT_MODEL, messages=messages)
             response_text = response.choices[0].message.content
