@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-bridge",
+  "version": "1.1.0",
+  "description": "WhatsApp bridge for chatbot",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js | pino-pretty"
+  },
+  "dependencies": {
+    "axios": "latest",
+    "express": "latest",
+    "express-rate-limit": "latest",
+    "libphonenumber-js": "latest",
+    "pino": "latest",
+    "pino-pretty": "latest",
+    "qrcode-terminal": "latest",
+    "whatsapp-web.js": "latest"
+  }
+}
